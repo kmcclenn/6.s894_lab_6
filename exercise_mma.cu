@@ -30,6 +30,42 @@ constexpr int32_t mma_size_k = 8;
 
 __global__ void mma_16x8x8_kernel(float const *a, float const *b, float *c) {
     // TODO: your GPU code here (using inline PTX)
+
+    // TODO: change float pointers to int
+    int a_mult = 2 * threadIdx.x;
+    int a_offset = threadIdx.x % 4;
+    int a_tl = __float_as_uint(a[a_mult - a_offset]);
+    int a_bl = __float_as_uint(a[a_mult - a_offset + 64]);
+    int a_tr = __float_as_uint(a[a_mult + 4 - a_offset]);
+    int a_br = __float_as_uint(a[a_mult + 4 - a_offset + 64]);
+
+    int b_mult = 8 * (threadIdx.x % 4);
+    int b_offset = threadIdx.x / 4;
+    int b_top = __float_as_uint(b[b_mult + b_offset]);
+    int b_bot = __float_as_uint(b[b_mult + b_offset + 32]);
+
+    int c_mult = 2 * threadIdx.x;
+    int c_tf = __float_as_uint(c[c_mult]);
+    int c_ts = __float_as_uint(c[c_mult + 1]);
+    int c_bf = __float_as_uint(c[c_mult + 64]);
+    int c_bs = __float_as_uint(c[c_mult + 65]);
+
+    // clang-format off
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32"
+        " {%0,%1,%2,%3},\n"
+        " {%4,%5,%6,%7},\n"
+        " {%8,%9},\n"
+        " {%0,%1,%2,%3};\n"
+        : "+r"(c_tf), "+r"(c_ts), "+r"(c_bf), "+r"(c_bs)
+        : "r"(a_tl), "r"(a_bl), "r"(a_tr), "r"(a_br), "r"(b_top), "r"(b_bot)
+    );
+    // clang-format on
+
+    c[c_mult] = __uint_as_float(c_tf);
+    c[c_mult + 1] = __uint_as_float(c_ts);
+    c[c_mult + 64] = __uint_as_float(c_bf);
+    c[c_mult + 65] = __uint_as_float(c_bs);
 }
 
 /// <--- /your code here --->
