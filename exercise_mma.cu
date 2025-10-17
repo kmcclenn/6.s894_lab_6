@@ -32,23 +32,26 @@ __global__ void mma_16x8x8_kernel(float const *a, float const *b, float *c) {
     // TODO: your GPU code here (using inline PTX)
 
     // TODO: change float pointers to int
-    int a_mult = 2 * threadIdx.x;
-    int a_offset = threadIdx.x % 4;
-    int a_tl = __float_as_uint(a[a_mult - a_offset]);
-    int a_bl = __float_as_uint(a[a_mult - a_offset + 64]);
-    int a_tr = __float_as_uint(a[a_mult + 4 - a_offset]);
-    int a_br = __float_as_uint(a[a_mult + 4 - a_offset + 64]);
+    // int a_mult = 2 * threadIdx.x;
+    // int a_offset = threadIdx.x % 4;
+    int a_row = (threadIdx.x / 4);
+    int a_col = threadIdx.x % 4;
+    int a_tl = __float_as_uint(a[8 * a_row + a_col]);
+    int a_bl = __float_as_uint(a[8 * (a_row + 8) + a_col]);
+    int a_tr = __float_as_uint(a[8 * a_row + a_col + 4]);
+    int a_br = __float_as_uint(a[8 * (a_row + 8) + a_col + 4]);
 
-    int b_mult = 8 * (threadIdx.x % 4);
-    int b_offset = threadIdx.x / 4;
-    int b_top = __float_as_uint(b[b_mult + b_offset]);
-    int b_bot = __float_as_uint(b[b_mult + b_offset + 32]);
+    int b_row = (threadIdx.x % 4);
+    int b_col = threadIdx.x / 4;
+    int b_top = __float_as_uint(b[8 * b_row + b_col]);
+    int b_bot = __float_as_uint(b[8 * (b_row + 4) + b_col]);
 
-    int c_mult = 2 * threadIdx.x;
-    int c_tf = __float_as_uint(c[c_mult]);
-    int c_ts = __float_as_uint(c[c_mult + 1]);
-    int c_bf = __float_as_uint(c[c_mult + 64]);
-    int c_bs = __float_as_uint(c[c_mult + 65]);
+    int c_row = threadIdx.x / 4;
+    int c_col = (threadIdx.x * 2) % 8;
+    int c_tf = __float_as_uint(c[8 * c_row + c_col]);
+    int c_ts = __float_as_uint(c[8 * c_row + c_col + 1]);
+    int c_bf = __float_as_uint(c[8 * (c_row + 8) + c_col]);
+    int c_bs = __float_as_uint(c[8 * (c_row + 8) + c_col + 1]);
 
     // clang-format off
     asm volatile(
@@ -62,10 +65,10 @@ __global__ void mma_16x8x8_kernel(float const *a, float const *b, float *c) {
     );
     // clang-format on
 
-    c[c_mult] = __uint_as_float(c_tf);
-    c[c_mult + 1] = __uint_as_float(c_ts);
-    c[c_mult + 64] = __uint_as_float(c_bf);
-    c[c_mult + 65] = __uint_as_float(c_bs);
+    c[8 * c_row + c_col] = __uint_as_float(c_tf);
+    c[8 * c_row + c_col + 1] = __uint_as_float(c_ts);
+    c[8 * (c_row + 8) + c_col] = __uint_as_float(c_bf);_
+    c[8 * (c_row + 8) + c_col + 1] = __uint_as_float(c_bs);
 }
 
 /// <--- /your code here --->

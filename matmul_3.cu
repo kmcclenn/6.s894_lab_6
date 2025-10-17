@@ -66,49 +66,421 @@ template <int N> __device__ __forceinline__ void async_wait_pending() {
 
 /// <--- your code here --->
 
-/*
-    // OPTIONAL: Uncomment this block to include your kernel implementation
-    // from Lab 5 for easy comparison.
+// OPTIONAL: Uncomment this block to include your kernel implementation
+// from Lab 5 for easy comparison.
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // Optimized GPU Implementation with Reduction along k (Baseline from Lab 5)
+////////////////////////////////////////////////////////////////////////////////
+// Optimized GPU Implementation with Reduction along k (Baseline from Lab 5)
 
-    #define HAS_LAB_5_BASELINE_IMPL // <~~ keep this line if you want to benchmark your Lab 5 kernel!
+#define HAS_LAB_5_BASELINE_IMPL // <~~ keep this line if you want to benchmark your Lab 5
+                                // kernel!
+#define K_STRIDE 1
+#define MTILE_SIZE_IMP 8
+#define BLOCK_SIZE_I_KERNEL_IMP 8
+#define BLOCK_SIZE_J_KERNEL_IMP 16
+#define BLOCK_SIZE_K_KERNEL_IMP 2
+#define BLOCK_SIZE_I_IMP (BLOCK_SIZE_I_KERNEL_IMP * MTILE_SIZE_IMP)
+#define BLOCK_SIZE_J_IMP (BLOCK_SIZE_J_KERNEL_IMP * MTILE_SIZE_IMP)
+#define BLOCK_SIZE_K_IMP (BLOCK_SIZE_K_KERNEL_IMP * MTILE_SIZE_IMP)
+#define BLOCK_SIZE_K_IMP_LOAD (K_STRIDE * BLOCK_SIZE_K_IMP)
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-    namespace matmul_improved_reduce {
+namespace matmul_improved_reduce {
 
-    // TODO: your GPU kernels here...
+#define SPLIT_K 1024
 
-    size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
-        // TODO: your CPU code here
-        return 0;
+__global__ void matmul_split(
+    int32_t size_i,
+    int32_t size_j,
+    int32_t size_k,
+    int32_t size_k_full,
+    float const *a, /* pointer to GPU memory */
+    float const *b, /* pointer to GPU memory */
+    float *scratch /* pointer to GPU memory */) {
+
+    extern __shared__ float inputs[];
+
+    // get pointer to specific chunk of a and b
+    float const *a_split = a + blockIdx.z * SPLIT_K;
+    float const *b_split = b + size_j * blockIdx.z * SPLIT_K;
+
+    // printf("%d", LblockIdx.z);
+
+    // global i, j indices
+    int32_t i_glob = (blockIdx.y * blockDim.y + threadIdx.y) * MTILE_SIZE_IMP;
+    int32_t j_glob = (blockIdx.x * blockDim.x + threadIdx.x) * MTILE_SIZE_IMP;
+
+    float *a_ptr = inputs;
+    float *b_ptr = a_ptr + BLOCK_SIZE_I_IMP * BLOCK_SIZE_K_IMP_LOAD;
+
+    float tile_out[MTILE_SIZE_IMP][MTILE_SIZE_IMP]; // assume MTILE_SIZE_IMP == 4
+    for (int i = 0; i < MTILE_SIZE_IMP; ++i) {
+        for (int j = 0; j < MTILE_SIZE_IMP; ++j) {
+            tile_out[i][j] = 0.0;
+        }
     }
 
-    void launch_matmul_improved_reduce(
-        int32_t size_i,
-        int32_t size_j,
-        int32_t size_k,
-        float const *a, // pointer to GPU memory
-        float const *b, // pointer to GPU memory
-        float *c,       // pointer to GPU memory
-        void *workspace // pointer to GPU memory
-    ) {
-        // TODO: your CPU code here
+#pragma unroll
+    for (int32_t mem_idx = 0; mem_idx < size_k; mem_idx += BLOCK_SIZE_K_IMP_LOAD) {
+
+        // have to loop over BLOCK_SIZE_K to make sure full shmem block is loaded
+        // make sure to account for all minitiles, too
+        // load two blocks in at each time to hide latency
+        for (int k_id = 0; k_id < BLOCK_SIZE_K_IMP_LOAD;
+             k_id += BLOCK_SIZE_J_KERNEL_IMP) {
+            int a_col = k_id + threadIdx.x;
+            for (int i = 0; i < MTILE_SIZE_IMP; ++i) {
+
+                int a_row = MTILE_SIZE_IMP * threadIdx.y + i;
+
+                int32_t base_a_idx = a_row * BLOCK_SIZE_K_IMP + a_col;
+                // int32_t base_a_idx = a_col * BLOCK_SIZE_I_IMP + a_row;
+
+                int32_t a_idx = (i_glob + i) * size_k_full + mem_idx + a_col;
+                a_ptr[base_a_idx] = a_split[a_idx];
+            }
+        }
+
+        // vectorize b loads
+        for (int k_id = 0; k_id < BLOCK_SIZE_K_IMP_LOAD;
+             k_id += BLOCK_SIZE_I_KERNEL_IMP) {
+            for (int i = 0; i < MTILE_SIZE_IMP; i += 4) {
+                int ky = k_id + threadIdx.y;
+                int32_t b_idx = (mem_idx + ky) * size_j + j_glob + i;
+
+                float4 b_vector = *reinterpret_cast<const float4 *>(b_split + b_idx);
+
+                int b_row = ky;
+                int b_col = MTILE_SIZE_IMP * threadIdx.x + i;
+                int32_t base_b_idx = b_row * BLOCK_SIZE_J_IMP + b_col;
+
+                b_ptr[base_b_idx] = b_vector.x;
+                b_ptr[base_b_idx + 1] = b_vector.y;
+                b_ptr[base_b_idx + 2] = b_vector.z;
+                b_ptr[base_b_idx + 3] = b_vector.w;
+            }
+        }
+
+        __syncthreads();
+
+        int mi = MTILE_SIZE_IMP * threadIdx.y;
+        int mj = MTILE_SIZE_IMP * threadIdx.x;
+        for (int mk = 0; mk < BLOCK_SIZE_K_IMP_LOAD; mk += MTILE_SIZE_IMP) {
+            // int mk_2 = mk + BLOCK_SIZE_K_REG;
+
+            // load minitiles
+            float b_mini_tile[MTILE_SIZE_IMP][MTILE_SIZE_IMP]; //[MTILE_SIZE];
+            float a_mini_tile[MTILE_SIZE_IMP][MTILE_SIZE_IMP];
+            for (int i = 0; i < MTILE_SIZE_IMP; ++i) {
+
+                for (int j = 0; j < MTILE_SIZE_IMP; ++j) {
+
+                    a_mini_tile[i][j] = a_ptr[(mi + i) * BLOCK_SIZE_K_IMP_LOAD + mk + j];
+                    b_mini_tile[i][j] = b_ptr[(mk + i) * BLOCK_SIZE_J_IMP + mj + j];
+
+                    // x
+                }
+            }
+
+            // loop through output, adding each FMA
+            for (int i = 0; i < MTILE_SIZE_IMP; ++i) {
+                for (int k = 0; k < MTILE_SIZE_IMP; ++k) {
+                    for (int j = 0; j < MTILE_SIZE_IMP; ++j) {
+                        tile_out[i][j] += a_mini_tile[i][k] * b_mini_tile[k][j];
+                    }
+                }
+            }
+        }
+        __syncthreads();
     }
 
-    } // namespace matmul_improved_reduce
-*/
+    // save minitile to output
+    float *c_split = scratch + size_i * size_j * blockIdx.z;
+
+    for (int i = 0; i < MTILE_SIZE_IMP; ++i) {
+        for (int j = 0; j < MTILE_SIZE_IMP; ++j) {
+            int row = i_glob + i;
+            int col = j_glob + j;
+            if ((unsigned)row < (unsigned)size_i && (unsigned)col < (unsigned)size_j) {
+                c_split[row * size_j + col] = tile_out[i][j];
+            }
+        }
+    }
+}
+
+__global__ void reduce_partial_matrices(
+    int32_t size_i,
+    int32_t size_j,
+    int num_splits,
+    float *sums,
+    float *c_out /* pointer to GPU memory */) {
+    for (int i = blockIdx.x; i < size_i; i += gridDim.x) {
+        for (int j = threadIdx.x; j < size_j; j += blockDim.x) {
+            c_out[size_j * i + j] = 0.0;
+            for (int k = 0; k < num_splits; ++k) {
+                float *cur_sum = sums + size_i * size_j * k;
+                c_out[size_j * i + j] += cur_sum[size_j * i + j];
+            }
+        }
+    }
+}
+size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
+    // TODO: your CPU code here
+    return size_i * size_j * (size_k / SPLIT_K) * sizeof(float);
+}
+
+void launch_matmul_improved_reduce(
+    int32_t size_i,
+    int32_t size_j,
+    int32_t size_k,
+    float const *a, // pointer to GPU memory
+    float const *b, // pointer to GPU memory
+    float *c,       // pointer to GPU memory
+    void *workspace // pointer to GPU memory
+) {
+    float *scratch = reinterpret_cast<float *>(workspace);
+
+    dim3 blockSize = dim3(BLOCK_SIZE_J_KERNEL_IMP, BLOCK_SIZE_I_KERNEL_IMP);
+    dim3 gridSize = dim3(
+        CEIL_DIV(size_j, (BLOCK_SIZE_J_IMP)),
+        CEIL_DIV(size_i, (BLOCK_SIZE_I_IMP)),
+        size_k / SPLIT_K);
+    // std::cout << gridSize. << std::endl;
+    uint32_t shmem_size_bytes =
+        (BLOCK_SIZE_I_IMP + BLOCK_SIZE_J_IMP) * BLOCK_SIZE_K_IMP_LOAD * sizeof(float);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_split,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes));
+
+    if (size_k < SPLIT_K) {
+        dim3 gridSizeSmall = dim3(
+            CEIL_DIV(size_j, (BLOCK_SIZE_J_IMP)),
+            CEIL_DIV(size_i, (BLOCK_SIZE_I_IMP)));
+        matmul_split<<<gridSizeSmall, blockSize, shmem_size_bytes>>>(
+            size_i,
+            size_j,
+            size_k,
+            size_k,
+            a,
+            b,
+            c);
+        return;
+    }
+
+    matmul_split<<<gridSize, blockSize, shmem_size_bytes>>>(
+        size_i,
+        size_j,
+        SPLIT_K,
+        size_k,
+        a,
+        b,
+        scratch);
+
+    reduce_partial_matrices<<<32 * 32, 48>>>(
+        size_i,
+        size_j,
+        size_k / SPLIT_K,
+        scratch,
+        c);
+}
+
+} // namespace matmul_improved_reduce
 
 ////////////////////////////////////////////////////////////////////////////////
 // Tensor Core GPU Implementation
 
+// fixed!
+#define TENSOR_I 16
+#define TENSOR_J 8
+#define TENSOR_K 8
+
+#define MTILE_T 4
+// #define MTILE_J_T 1
+#define BLOCK_I_T 2
+#define BLOCK_J_T 4
+#define BLOCK_K_T 2
+
+#define TILE_I_T (BLOCK_I_T * TENSOR_I * MTILE_T)
+#define TILE_J_T (BLOCK_J_T * TENSOR_J * MTILE_T)
+#define TILE_K_T (BLOCK_K_T * TENSOR_K * MTILE_T)
 namespace matmul_tensor {
 
-/* TODO: your GPU kernels here... */
+__global__ void matmul_tensor(
+    int32_t size_i,
+    int32_t size_j,
+    int32_t size_k,
+    int32_t size_k_full,
+    float const *a, /* pointer to GPU memory */
+    float const *b, /* pointer to GPU memory */
+    float *scratch /* pointer to GPU memory */) {
+
+    extern __shared__ float inputs[];
+
+    // get pointer to specific chunk of a and b
+    float const *a_split = a + blockIdx.z * SPLIT_K;
+    float const *b_split = b + size_j * blockIdx.z * SPLIT_K;
+
+    // printf("%d", LblockIdx.z);
+
+    // global i, j indices
+    int32_t i_glob = (blockIdx.y * blockDim.y + threadIdx.z) * MTILE_T * TENSOR_I;
+    int32_t j_glob = (blockIdx.x * blockDim.x + threadIdx.y) * MTILE_T * TENSOR_J;
+
+    float *a_ptr = inputs;
+    float *b_ptr = a_ptr + TILE_I_T * TILE_K_T;
+
+    // [specific parts of C][row of mtile][col of mtile]
+    int tile_out[MTILE_T][MTILE_T][4];
+    for (int k = 0; k < 4; ++k) {
+        for (int i = 0; i < MTILE_T; ++i) {
+            for (int j = 0; j < MTILE_T; ++j) {
+                tile_out[i][j][k] = 0;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int32_t mem_idx = 0; mem_idx < size_k; mem_idx += TILE_K_T) {
+
+        // have to loop over BLOCK_SIZE_K to make sure full shmem block is loaded
+        // make sure to account for all minitiles, too
+        // load two blocks in at each time to hide latency
+
+        // iterate down A, loading values. parameters tuned so only one loop needed
+        for (int i_idx = 0; i_idx < TILE_I_T; i_idx += BLOCK_I_T) {
+            int a_col = 32 * threadIdx.z + threadIdx.x; // fix magic constant TODO
+            int a_row = i_idx + threadIdx.y;
+            int32_t tile_a_idx = a_row * TILE_K_T + a_col;
+
+            int32_t glob_row = blockIdx.y * TILE_I_T + a_row;
+            int32_t glob_col = mem_idx + a_col;
+            int32_t glob_a_idx = glob_row * size_k_full + glob_col;
+
+            if (glob_row < size_i) {
+                a_ptr[tile_a_idx] = a_split[glob_a_idx];
+            } else {
+                a_ptr[tile_a_idx] = 0.0f;
+            }
+            // a_ptr[tile_a_idx] = a_split[glob_a_idx];
+        }
+
+        for (int j_idx = 0; j_idx < TILE_K_T; j_idx += 2) {
+            int b_col = 32 * threadIdx.y + threadIdx.x; // fix magic constant TODO
+            int b_row = j_idx + threadIdx.z;
+            int32_t tile_b_idx = b_row * TILE_J_T + b_col;
+
+            int32_t glob_col = blockIdx.x * TILE_J_T + b_col;
+            int32_t glob_row = mem_idx + b_row;
+            int32_t glob_b_idx = glob_row * size_j + glob_col;
+
+            // if (glob_row < size_k_full) {
+            b_ptr[tile_b_idx] = b_split[glob_b_idx];
+            // } else {
+            //     b_ptr[tile_b_idx] = 0.0f;
+            // }
+        }
+
+        __syncthreads();
+
+        // within a tile
+
+        // steps 8 for the tile
+        for (int k_step = 0; k_step < TILE_K_T; k_step += TENSOR_K * MTILE_T) {
+
+            int a_mini_tile[MTILE_T][MTILE_T][4]; //[MTILE_SIZE];
+            int b_mini_tile[MTILE_T][MTILE_T][2];
+            for (int i = 0; i < MTILE_T; ++i) {
+                for (int j = 0; j < MTILE_T; ++j) {
+                    // load register minitile
+                    int a_row = (threadIdx.x / 4) + threadIdx.z * TENSOR_I * MTILE_T +
+                        i * TENSOR_I;
+                    int a_col = (threadIdx.x % 4) + k_step + TENSOR_K * j;
+                    a_mini_tile[i][j][0] =
+                        __float_as_uint(a_ptr[TILE_K_T * a_row + a_col]);
+                    a_mini_tile[i][j][1] =
+                        __float_as_uint(a_ptr[TILE_K_T * (a_row + 8) + a_col]);
+                    a_mini_tile[i][j][2] =
+                        __float_as_uint(a_ptr[TILE_K_T * a_row + a_col + 4]);
+                    a_mini_tile[i][j][3] =
+                        __float_as_uint(a_ptr[TILE_K_T * (a_row + 8) + a_col + 4]);
+
+                    int b_row = (threadIdx.x % 4) + k_step + TENSOR_K * i;
+                    int b_col = (threadIdx.x / 4) + threadIdx.y * TENSOR_J * MTILE_T +
+                        j * TENSOR_J;
+                    b_mini_tile[i][j][0] =
+                        __float_as_uint(b_ptr[TILE_J_T * b_row + b_col]);
+                    b_mini_tile[i][j][1] =
+                        __float_as_uint(b_ptr[TILE_J_T * (b_row + 4) + b_col]);
+                }
+            }
+
+            // do matmul
+
+            for (int i = 0; i < MTILE_T; ++i) {
+                for (int j = 0; j < MTILE_T; ++j) {
+                    // clang-format off
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32"
+                        " {%0,%1,%2,%3},\n"
+                        " {%4,%5,%6,%7},\n"
+                        " {%8,%9},\n"
+                        " {%0,%1,%2,%3};\n"
+                        : "+r"(tile_out[i][j][0]), "+r"(tile_out[i][j][1]), "+r"(tile_out[i][j][2]), "+r"(tile_out[i][j][3])
+                        : "r"(a_mini_tile[i][j][0]), "r"(a_mini_tile[i][j][1]), "r"(a_mini_tile[i][j][2]), "r"(a_mini_tile[i][j][3]),
+                            "r"(b_mini_tile[i][j][0]), "r"(b_mini_tile[i][j][1])
+                    );
+                    // clang-format on
+                }
+            }
+        }
+    }
+
+    // save minitile to output
+    float *c_split = scratch + size_i * size_j * blockIdx.z;
+
+    int c_row = threadIdx.x / 4;
+    int c_col = (threadIdx.x * 2) % 8;
+
+    for (int i = 0; i < MTILE_T; ++i) {
+        for (int j = 0; j < MTILE_T; ++j) {
+            int row = i_glob + i * TENSOR_I + c_row;
+            int col = j_glob + j * TENSOR_J + c_col;
+
+            // might have to have more bounds checks here. ...
+            if ((unsigned)row < (unsigned)size_i && (unsigned)col < (unsigned)size_j) {
+                c_split[row * size_j + col] = __uint_as_float(tile_out[i][j][0]);
+                c_split[row * size_j + col + 1] = __uint_as_float(tile_out[i][j][1]);
+                c_split[(row + 8) * size_j + col] = __uint_as_float(tile_out[i][j][2]);
+                c_split[(row + 8) * size_j + col + 1] =
+                    __uint_as_float(tile_out[i][j][3]);
+            }
+        }
+    }
+}
+
+__global__ void reduce_partial_matrices(
+    int32_t size_i,
+    int32_t size_j,
+    int num_splits,
+    float *sums,
+    float *c_out /* pointer to GPU memory */) {
+    for (int i = blockIdx.x; i < size_i; i += gridDim.x) {
+        for (int j = threadIdx.x; j < size_j; j += blockDim.x) {
+            c_out[size_j * i + j] = 0.0;
+            for (int k = 0; k < num_splits; ++k) {
+                float *cur_sum = sums + size_i * size_j * k;
+                c_out[size_j * i + j] += cur_sum[size_j * i + j];
+            }
+        }
+    }
+}
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
     /* TODO: your CPU code here */
-    return 0;
+    return size_i * size_j * (size_k / SPLIT_K) * sizeof(float);
 }
 
 void launch_matmul_tensor(
@@ -120,7 +492,51 @@ void launch_matmul_tensor(
     float *c,       /* pointer to GPU memory */
     void *workspace /* pointer to GPU memory */
 ) {
-    /* TODO: your CPU code here */
+    float *scratch = reinterpret_cast<float *>(workspace);
+
+    dim3 blockSize = dim3(32, BLOCK_J_T, BLOCK_I_T);
+    dim3 gridSize = dim3(
+        CEIL_DIV(size_j, (TILE_J_T)),
+        CEIL_DIV(size_i, (TILE_I_T)),
+        size_k / SPLIT_K);
+    // std::cout << gridSize. << std::endl;
+    uint32_t shmem_size_bytes = (TILE_I_T + TILE_J_T) * TILE_K_T * sizeof(float);
+    // std::cout << "\n" << shmem_size_bytes / 1000 << " KB" << std::endl;
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_tensor,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes));
+
+    if (size_k < SPLIT_K) {
+        dim3 gridSizeSmall =
+            dim3(CEIL_DIV(size_j, (TILE_J_T)), CEIL_DIV(size_i, (TILE_I_T)));
+        matmul_tensor<<<gridSizeSmall, blockSize, shmem_size_bytes>>>(
+            size_i,
+            size_j,
+            size_k,
+            size_k,
+            a,
+            b,
+            c);
+        return;
+    }
+
+    matmul_tensor<<<gridSize, blockSize, shmem_size_bytes>>>(
+        size_i,
+        size_j,
+        SPLIT_K,
+        size_k,
+        a,
+        b,
+        scratch);
+
+    reduce_partial_matrices<<<32 * 32, 48>>>(
+        size_i,
+        size_j,
+        size_k / SPLIT_K,
+        scratch,
+        c);
 }
 
 }; // namespace matmul_tensor
@@ -260,8 +676,8 @@ void run_config(
     }
 
     void *flush_gpu = nullptr;
-    CUDA_CHECK(cudaMalloc(&flush_gpu, 1024*1024*64));
-    CUDA_CHECK(cudaMemset(flush_gpu, 1, 1024*1024*64));
+    CUDA_CHECK(cudaMalloc(&flush_gpu, 1024 * 1024 * 64));
+    CUDA_CHECK(cudaMemset(flush_gpu, 1, 1024 * 1024 * 64));
 
     if (phase == Phase::BENCHMARK) {
         printf("  %6d  %6d  %6d", size_i, size_j, size_k);
@@ -309,7 +725,7 @@ void run_config(
                 if (workspace_size > 0) {
                     CUDA_CHECK(cudaMemset(workspace_gpu, 0, workspace_size));
                 }
-                CUDA_CHECK(cudaMemset(flush_gpu, 1, 1024*1024*64));
+                CUDA_CHECK(cudaMemset(flush_gpu, 1, 1024 * 1024 * 64));
             },
             [&]() {
                 Impl::run(size_i, size_j, size_k, a_gpu, b_gpu, c_gpu, workspace_gpu);
@@ -506,7 +922,6 @@ void print_speedup(
 
 int main(int argc, char **argv) {
     std::string test_data_dir = ".";
-
 
     auto configs = std::vector<BenchmarkConfig>{
         {3072, 3072, 3072},
