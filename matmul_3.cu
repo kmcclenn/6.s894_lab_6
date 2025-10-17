@@ -296,8 +296,9 @@ void launch_matmul_improved_reduce(
 #define TENSOR_I 16
 #define TENSOR_J 8
 #define TENSOR_K 8
+#define VECTOR_WIDTH 32
 
-#define MTILE_T 4
+#define MTILE_T 2
 // #define MTILE_J_T 1
 #define BLOCK_I_T 2
 #define BLOCK_J_T 4
@@ -320,24 +321,26 @@ __global__ void matmul_tensor(
     extern __shared__ float inputs[];
 
     // get pointer to specific chunk of a and b
-    float const *a_split = a + blockIdx.z * SPLIT_K;
-    float const *b_split = b + size_j * blockIdx.z * SPLIT_K;
-
-    // printf("%d", LblockIdx.z);
+    float const *a_split = a + blockIdx.z * SPLIT_K;          // to the right
+    float const *b_split = b + size_j * blockIdx.z * SPLIT_K; // downwards
 
     // global i, j indices
-    int32_t i_glob = (blockIdx.y * blockDim.y + threadIdx.z) * MTILE_T * TENSOR_I;
-    int32_t j_glob = (blockIdx.x * blockDim.x + threadIdx.y) * MTILE_T * TENSOR_J;
+    // (current block idx + thread idx into that block) * amount of work per thread
+    int32_t i_glob = (blockIdx.y * blockDim.z + threadIdx.z) * MTILE_T * TENSOR_I;
+    int32_t j_glob = (blockIdx.x * blockDim.y + threadIdx.y) * MTILE_T * TENSOR_J;
 
     float *a_ptr = inputs;
     float *b_ptr = a_ptr + TILE_I_T * TILE_K_T;
 
-    // [specific parts of C][row of mtile][col of mtile]
-    int tile_out[MTILE_T][MTILE_T][4];
+    // [row of mtile][col of mtile][specific parts of C][
+    int tile_out[MTILE_T][MTILE_T][4]; // [MTILE_T][MTILE_T]
+    // for (int k = 0; k < 4; ++k) {
+    //     tile_out[k] = 0.0f;
+    // }
     for (int k = 0; k < 4; ++k) {
         for (int i = 0; i < MTILE_T; ++i) {
             for (int j = 0; j < MTILE_T; ++j) {
-                tile_out[i][j][k] = 0;
+                tile_out[i][j][k] = 0.0f;
             }
         }
     }
@@ -349,37 +352,59 @@ __global__ void matmul_tensor(
         // make sure to account for all minitiles, too
         // load two blocks in at each time to hide latency
 
+        // could compose and make loads better
+        // TODO: hardcoded number
+        // for (int ij = 0; ij < 32; ++ij) {
+        //     int i_idx = BLOCK_J_T * ij;
+        //     int j_idx = BLOCK_K_T * ij;
+
+        //     int a_col = VECTOR_WIDTH * threadIdx.z + threadIdx.x; //
+        //     int a_row = i_idx + threadIdx.y;
+        //     int32_t tile_a_idx = a_row * TILE_K_T + a_col;
+
+        //     int32_t glob_row_a = blockIdx.y * TILE_I_T + a_row;
+        //     int32_t glob_col_a = mem_idx + a_col;
+        //     int32_t glob_a_idx = glob_row_a * size_k_full + glob_col_a;
+
+        //     // if (a_row < TILE_I_T && a_col < TILE_K_T) {
+        //     a_ptr[tile_a_idx] = a_split[glob_a_idx];
+
+        //     int b_col = VECTOR_WIDTH * threadIdx.y + threadIdx.x;
+        //     int b_row = j_idx + threadIdx.z;
+        //     int32_t tile_b_idx = b_row * TILE_J_T + b_col;
+
+        //     int32_t glob_col_b = blockIdx.x * TILE_J_T + b_col;
+        //     int32_t glob_row_b = mem_idx + b_row;
+        //     int32_t glob_b_idx = glob_row_b * size_j + glob_col_b;
+        //     // if (b_row < TILE_K_T && b_col < TILE_J_T) {
+        //     b_ptr[tile_b_idx] = b_split[glob_b_idx];
+        // }
+
         // iterate down A, loading values. parameters tuned so only one loop needed
-        for (int i_idx = 0; i_idx < TILE_I_T; i_idx += BLOCK_I_T) {
-            int a_col = 32 * threadIdx.z + threadIdx.x; // fix magic constant TODO
-            int a_row = i_idx + threadIdx.y;
+        for (int i_idx = 0; i_idx < TILE_I_T; i_idx += BLOCK_J_T * BLOCK_I_T) {
+            int a_col = threadIdx.x; //
+            int a_row = i_idx + threadIdx.y + BLOCK_J_T * threadIdx.z;
             int32_t tile_a_idx = a_row * TILE_K_T + a_col;
 
             int32_t glob_row = blockIdx.y * TILE_I_T + a_row;
             int32_t glob_col = mem_idx + a_col;
             int32_t glob_a_idx = glob_row * size_k_full + glob_col;
 
-            if (glob_row < size_i) {
-                a_ptr[tile_a_idx] = a_split[glob_a_idx];
-            } else {
-                a_ptr[tile_a_idx] = 0.0f;
-            }
-            // a_ptr[tile_a_idx] = a_split[glob_a_idx];
+            // if (a_col < TILE_K_T) {
+            a_ptr[tile_a_idx] = a_split[glob_a_idx];
+            // }
         }
 
-        for (int j_idx = 0; j_idx < TILE_K_T; j_idx += 2) {
-            int b_col = 32 * threadIdx.y + threadIdx.x; // fix magic constant TODO
-            int b_row = j_idx + threadIdx.z;
+        for (int j_idx = 0; j_idx < TILE_K_T; j_idx += BLOCK_J_T) {
+            int b_col = VECTOR_WIDTH * threadIdx.z + threadIdx.x;
+            int b_row = j_idx + threadIdx.y;
             int32_t tile_b_idx = b_row * TILE_J_T + b_col;
 
             int32_t glob_col = blockIdx.x * TILE_J_T + b_col;
             int32_t glob_row = mem_idx + b_row;
             int32_t glob_b_idx = glob_row * size_j + glob_col;
-
-            // if (glob_row < size_k_full) {
+            // if (b_col < TILE_J_T) {
             b_ptr[tile_b_idx] = b_split[glob_b_idx];
-            // } else {
-            //     b_ptr[tile_b_idx] = 0.0f;
             // }
         }
 
@@ -387,11 +412,10 @@ __global__ void matmul_tensor(
 
         // within a tile
 
-        // steps 8 for the tile
         for (int k_step = 0; k_step < TILE_K_T; k_step += TENSOR_K * MTILE_T) {
 
-            int a_mini_tile[MTILE_T][MTILE_T][4]; //[MTILE_SIZE];
-            int b_mini_tile[MTILE_T][MTILE_T][2];
+            int a_mini_tile[MTILE_T][MTILE_T][4]; // = {0, 0, 0, 0}; //[MTILE_T][MTILE_T];
+            int b_mini_tile[MTILE_T][MTILE_T][2]; // = {0, 0};
             for (int i = 0; i < MTILE_T; ++i) {
                 for (int j = 0; j < MTILE_T; ++j) {
                     // load register minitile
@@ -421,21 +445,24 @@ __global__ void matmul_tensor(
 
             for (int i = 0; i < MTILE_T; ++i) {
                 for (int j = 0; j < MTILE_T; ++j) {
-                    // clang-format off
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32"
-                        " {%0,%1,%2,%3},\n"
-                        " {%4,%5,%6,%7},\n"
-                        " {%8,%9},\n"
-                        " {%0,%1,%2,%3};\n"
-                        : "+r"(tile_out[i][j][0]), "+r"(tile_out[i][j][1]), "+r"(tile_out[i][j][2]), "+r"(tile_out[i][j][3])
-                        : "r"(a_mini_tile[i][j][0]), "r"(a_mini_tile[i][j][1]), "r"(a_mini_tile[i][j][2]), "r"(a_mini_tile[i][j][3]),
-                            "r"(b_mini_tile[i][j][0]), "r"(b_mini_tile[i][j][1])
-                    );
-                    // clang-format on
+                    for (int k = 0; k < MTILE_T; ++k) {
+                        // clang-format off
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32"
+                            " {%0,%1,%2,%3},\n"
+                            " {%4,%5,%6,%7},\n"
+                            " {%8,%9},\n"
+                            " {%0,%1,%2,%3};\n"
+                            : "+r"(tile_out[i][j][0]), "+r"(tile_out[i][j][1]), "+r"(tile_out[i][j][2]), "+r"(tile_out[i][j][3])
+                            : "r"(a_mini_tile[i][k][0]), "r"(a_mini_tile[i][k][1]), "r"(a_mini_tile[i][k][2]), "r"(a_mini_tile[i][k][3]),
+                                "r"(b_mini_tile[k][j][0]), "r"(b_mini_tile[k][j][1])
+                        );
+                        // clang-format on
+                    }
                 }
             }
         }
+        __syncthreads();
     }
 
     // save minitile to output
@@ -444,13 +471,17 @@ __global__ void matmul_tensor(
     int c_row = threadIdx.x / 4;
     int c_col = (threadIdx.x * 2) % 8;
 
+    // could parallelize more
     for (int i = 0; i < MTILE_T; ++i) {
+        // int i = threadIdx.y;
         for (int j = 0; j < MTILE_T; ++j) {
-            int row = i_glob + i * TENSOR_I + c_row;
-            int col = j_glob + j * TENSOR_J + c_col;
+
+            int row = i_glob + c_row + i * TENSOR_I;
+            int col = j_glob + c_col + j * TENSOR_J;
 
             // might have to have more bounds checks here. ...
             if ((unsigned)row < (unsigned)size_i && (unsigned)col < (unsigned)size_j) {
+                // tile_out[i][j] -> tile_out
                 c_split[row * size_j + col] = __uint_as_float(tile_out[i][j][0]);
                 c_split[row * size_j + col + 1] = __uint_as_float(tile_out[i][j][1]);
                 c_split[(row + 8) * size_j + col] = __uint_as_float(tile_out[i][j][2]);
@@ -494,7 +525,7 @@ void launch_matmul_tensor(
 ) {
     float *scratch = reinterpret_cast<float *>(workspace);
 
-    dim3 blockSize = dim3(32, BLOCK_J_T, BLOCK_I_T);
+    dim3 blockSize = dim3(VECTOR_WIDTH, BLOCK_J_T, BLOCK_I_T);
     dim3 gridSize = dim3(
         CEIL_DIV(size_j, (TILE_J_T)),
         CEIL_DIV(size_i, (TILE_I_T)),
@@ -508,9 +539,12 @@ void launch_matmul_tensor(
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
 
-    if (size_k < SPLIT_K) {
+    if (size_k < SPLIT_K || size_i >= 3072) {
         dim3 gridSizeSmall =
-            dim3(CEIL_DIV(size_j, (TILE_J_T)), CEIL_DIV(size_i, (TILE_I_T)));
+            dim3(CEIL_DIV(size_j, (TILE_J_T)), CEIL_DIV(size_i, (TILE_I_T)), 1);
+
+        // std::cout << "(x: " << gridSizeSmall.x << ", y: " << gridSizeSmall.y << ")"
+        //           << std::endl;
         matmul_tensor<<<gridSizeSmall, blockSize, shmem_size_bytes>>>(
             size_i,
             size_j,
@@ -521,7 +555,6 @@ void launch_matmul_tensor(
             c);
         return;
     }
-
     matmul_tensor<<<gridSize, blockSize, shmem_size_bytes>>>(
         size_i,
         size_j,
