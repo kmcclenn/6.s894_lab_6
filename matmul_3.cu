@@ -299,7 +299,7 @@ void launch_matmul_improved_reduce(
 #define VECTOR_WIDTH 32
 
 #define MTILE_T 4
-// #define MTILE_J_T 1
+
 #define BLOCK_I_T 2
 #define BLOCK_J_T 4
 #define BLOCK_K_T 1
@@ -307,6 +307,9 @@ void launch_matmul_improved_reduce(
 #define TILE_I_T (BLOCK_I_T * TENSOR_I * MTILE_T)
 #define TILE_J_T (BLOCK_J_T * TENSOR_J * MTILE_T)
 #define TILE_K_T (BLOCK_K_T * TENSOR_K * MTILE_T)
+
+#define TILE_K_T_PAD (TILE_K_T + 4)
+#define TILE_J_T_PAD (TILE_J_T + 36)
 namespace matmul_tensor {
 
 __global__ void matmul_tensor(
@@ -330,10 +333,10 @@ __global__ void matmul_tensor(
     int32_t j_glob = (blockIdx.x * blockDim.y + threadIdx.y) * MTILE_T * TENSOR_J;
 
     float *a_ptr = inputs;
-    float *b_ptr = a_ptr + TILE_I_T * TILE_K_T;
+    float *b_ptr = a_ptr + TILE_I_T * TILE_K_T_PAD;
 
     // [row of mtile][col of mtile][specific parts of C][
-    int tile_out[MTILE_T][MTILE_T][4]; // [MTILE_T][MTILE_T]
+    float tile_out[MTILE_T][MTILE_T][4]; // [MTILE_T][MTILE_T]
     // for (int k = 0; k < 4; ++k) {
     //     tile_out[k] = 0.0f;
     // }
@@ -354,54 +357,31 @@ __global__ void matmul_tensor(
 
         // could compose and make loads better
         // TODO: hardcoded number
-        // for (int ij = 0; ij < 32; ++ij) {
-        //     int i_idx = BLOCK_J_T * ij;
-        //     int j_idx = BLOCK_K_T * ij;
-
-        //     int a_col = VECTOR_WIDTH * threadIdx.z + threadIdx.x; //
-        //     int a_row = i_idx + threadIdx.y;
-        //     int32_t tile_a_idx = a_row * TILE_K_T + a_col;
-
-        //     int32_t glob_row_a = blockIdx.y * TILE_I_T + a_row;
-        //     int32_t glob_col_a = mem_idx + a_col;
-        //     int32_t glob_a_idx = glob_row_a * size_k_full + glob_col_a;
-
-        //     // if (a_row < TILE_I_T && a_col < TILE_K_T) {
-        //     a_ptr[tile_a_idx] = a_split[glob_a_idx];
-
-        //     int b_col = VECTOR_WIDTH * threadIdx.y + threadIdx.x;
-        //     int b_row = j_idx + threadIdx.z;
-        //     int32_t tile_b_idx = b_row * TILE_J_T + b_col;
-
-        //     int32_t glob_col_b = blockIdx.x * TILE_J_T + b_col;
-        //     int32_t glob_row_b = mem_idx + b_row;
-        //     int32_t glob_b_idx = glob_row_b * size_j + glob_col_b;
-        //     // if (b_row < TILE_K_T && b_col < TILE_J_T) {
-        //     b_ptr[tile_b_idx] = b_split[glob_b_idx];
-        // }
 
         // iterate down A, loading values. parameters tuned so only one loop needed
         for (int i_idx = 0; i_idx < TILE_I_T; i_idx += BLOCK_J_T * BLOCK_I_T) {
             for (int k_idx = 0; k_idx < TILE_K_T; k_idx += VECTOR_WIDTH) {
                 int a_col = threadIdx.x + k_idx; //
                 int a_row = i_idx + threadIdx.y + BLOCK_J_T * threadIdx.z;
-                int32_t tile_a_idx = a_row * TILE_K_T + a_col;
+                int32_t tile_a_idx = a_row * TILE_K_T_PAD + a_col;
 
                 int32_t glob_row = blockIdx.y * TILE_I_T + a_row;
                 int32_t glob_col = mem_idx + a_col;
                 int32_t glob_a_idx = glob_row * size_k_full + glob_col;
 
-                // if (a_col < TILE_K_T) {
+                // if (a_row < TILE_I_T) {
                 a_ptr[tile_a_idx] = a_split[glob_a_idx];
+                // }
             }
             // }
         }
 
         for (int k_idx = 0; k_idx < TILE_K_T; k_idx += BLOCK_J_T * BLOCK_I_T) {
             for (int j_idx = 0; j_idx < TILE_J_T; j_idx += VECTOR_WIDTH) {
+
                 int b_col = j_idx + threadIdx.x;
                 int b_row = k_idx + threadIdx.y + BLOCK_J_T * threadIdx.z;
-                int32_t tile_b_idx = b_row * TILE_J_T + b_col;
+                int32_t tile_b_idx = b_row * TILE_J_T_PAD + b_col;
 
                 int32_t glob_col = blockIdx.x * TILE_J_T + b_col;
                 int32_t glob_row = mem_idx + b_row;
@@ -427,21 +407,21 @@ __global__ void matmul_tensor(
                         i * TENSOR_I;
                     int a_col = (threadIdx.x % 4) + k_step + TENSOR_K * j;
                     a_mini_tile[i][j][0] =
-                        __float_as_uint(a_ptr[TILE_K_T * a_row + a_col]);
+                        __float_as_uint(a_ptr[TILE_K_T_PAD * a_row + a_col]);
                     a_mini_tile[i][j][1] =
-                        __float_as_uint(a_ptr[TILE_K_T * (a_row + 8) + a_col]);
+                        __float_as_uint(a_ptr[TILE_K_T_PAD * (a_row + 8) + a_col]);
                     a_mini_tile[i][j][2] =
-                        __float_as_uint(a_ptr[TILE_K_T * a_row + a_col + 4]);
+                        __float_as_uint(a_ptr[TILE_K_T_PAD * a_row + a_col + 4]);
                     a_mini_tile[i][j][3] =
-                        __float_as_uint(a_ptr[TILE_K_T * (a_row + 8) + a_col + 4]);
+                        __float_as_uint(a_ptr[TILE_K_T_PAD * (a_row + 8) + a_col + 4]);
 
                     int b_row = (threadIdx.x % 4) + k_step + TENSOR_K * i;
                     int b_col = (threadIdx.x / 4) + threadIdx.y * TENSOR_J * MTILE_T +
                         j * TENSOR_J;
                     b_mini_tile[i][j][0] =
-                        __float_as_uint(b_ptr[TILE_J_T * b_row + b_col]);
+                        __float_as_uint(b_ptr[TILE_J_T_PAD * b_row + b_col]);
                     b_mini_tile[i][j][1] =
-                        __float_as_uint(b_ptr[TILE_J_T * (b_row + 4) + b_col]);
+                        __float_as_uint(b_ptr[TILE_J_T_PAD * (b_row + 4) + b_col]);
                 }
             }
 
@@ -457,7 +437,7 @@ __global__ void matmul_tensor(
                             " {%4,%5,%6,%7},\n"
                             " {%8,%9},\n"
                             " {%0,%1,%2,%3};\n"
-                            : "+r"(tile_out[i][j][0]), "+r"(tile_out[i][j][1]), "+r"(tile_out[i][j][2]), "+r"(tile_out[i][j][3])
+                            : "+f"(tile_out[i][j][0]), "+f"(tile_out[i][j][1]), "+f"(tile_out[i][j][2]), "+f"(tile_out[i][j][3])
                             : "r"(a_mini_tile[i][k][0]), "r"(a_mini_tile[i][k][1]), "r"(a_mini_tile[i][k][2]), "r"(a_mini_tile[i][k][3]),
                                 "r"(b_mini_tile[k][j][0]), "r"(b_mini_tile[k][j][1])
                         );
@@ -486,13 +466,10 @@ __global__ void matmul_tensor(
             // might have to have more bounds checks here. ...
             if ((unsigned)row < (unsigned)size_i && (unsigned)col < (unsigned)size_j) {
 
-                *reinterpret_cast<float2 *>(&c_split[row * size_j + col]) = make_float2(
-                    __uint_as_float(tile_out[i][j][0]),
-                    __uint_as_float(tile_out[i][j][1]));
+                *reinterpret_cast<float2 *>(&c_split[row * size_j + col]) =
+                    make_float2(tile_out[i][j][0], tile_out[i][j][1]);
                 *reinterpret_cast<float2 *>(&c_split[(row + 8) * size_j + col]) =
-                    make_float2(
-                        __uint_as_float(tile_out[i][j][2]),
-                        __uint_as_float(tile_out[i][j][3]));
+                    make_float2(tile_out[i][j][2], tile_out[i][j][3]);
             }
         }
     }
@@ -537,7 +514,7 @@ void launch_matmul_tensor(
         CEIL_DIV(size_i, (TILE_I_T)),
         size_k / SPLIT_K);
     // std::cout << gridSize. << std::endl;
-    uint32_t shmem_size_bytes = (TILE_I_T + TILE_J_T) * TILE_K_T * sizeof(float);
+    uint32_t shmem_size_bytes = (TILE_I_T + TILE_J_T_PAD) * TILE_K_T_PAD * sizeof(float);
     // std::cout << "\n" << shmem_size_bytes / 1000 << " KB" << std::endl;
 
     CUDA_CHECK(cudaFuncSetAttribute(
@@ -545,7 +522,7 @@ void launch_matmul_tensor(
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
 
-    if (size_k < SPLIT_K || size_i >= 1024) {
+    if (size_i >= 512) {
         dim3 gridSizeSmall =
             dim3(CEIL_DIV(size_j, (TILE_J_T)), CEIL_DIV(size_i, (TILE_I_T)), 1);
 
